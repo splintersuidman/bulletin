@@ -2,6 +2,7 @@
 
 module Main where
 
+import           Control.Monad          (when)
 import           Control.Monad.Except   (ExceptT, MonadError (throwError),
                                          runExceptT)
 import           Control.Monad.IO.Class (MonadIO (liftIO))
@@ -13,6 +14,8 @@ import           Data.Text              (Text)
 import qualified Data.Text              as Text
 import qualified Data.Text.IO           as Text
 import qualified Data.Time              as Time
+import           Data.Traversable       (for)
+import           System.Environment     (getArgs)
 import           System.Exit            (die)
 import           System.FilePath        (takeExtension)
 import           Text.Pandoc
@@ -88,6 +91,7 @@ data BulletinError
   | BulletinTomlDecodeError [TomlDecodeError]
   | BulletinCompileError BL.ByteString
   | BulletinTemplateError String
+  | BulletinUsageError String
 
 instance Show BulletinError where
   show = \case
@@ -96,6 +100,7 @@ instance Show BulletinError where
     BulletinTomlDecodeError errs -> "Toml error(s): " <> (concat $ intersperse "\n" $ fmap show errs)
     BulletinCompileError err -> "Compile error: " <> Pandoc.toStringLazy err
     BulletinTemplateError err -> "Template error: " <> err
+    BulletinUsageError err -> "Usage error: " <> err
 
 newtype BulletinIO a = BulletinIO { unBulletinIO :: ExceptT BulletinError IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadError BulletinError)
@@ -220,7 +225,10 @@ writeBulletin bulletin doc = do
 
 main :: IO ()
 main = runBulletinIO $ do
-  bulletinConfig <- readBulletinConfig "ib0.toml"
-  liftIO $ Text.putStrLn $ Toml.encode bulletinCodec bulletinConfig
-  bulletin <- processContributions <$> readContributions bulletinConfig
-  writeBulletin bulletin $ compileBulletin bulletin
+  args <- liftIO getArgs
+  when (args == []) $ throwError $ BulletinUsageError "Specify configuration file(s): bulletin <file ...>"
+  _ <- for args $ \configFile -> do
+    bulletinConfig <- readBulletinConfig configFile
+    bulletin <- processContributions <$> readContributions bulletinConfig
+    writeBulletin bulletin $ compileBulletin bulletin
+  pure ()
