@@ -162,7 +162,7 @@ correctHeaderLevels p = case minHeaderLevel p of
 -- with the title, and the author set in italic.
 addContributionHeader :: Contribution Pandoc -> Pandoc
 addContributionHeader contribution = case contributionDocument contribution of
-  Pandoc meta blocks -> Pandoc meta $ [RawBlock "typst" "#pagebreak()", Header 1 nullAttr title, Para author] <> blocks
+  Pandoc meta blocks -> Pandoc meta $ [Header 1 nullAttr title, Para author] <> blocks
   where
     title = P.toList $ P.text $ contributionTitle contribution
     author = P.toList $ P.emph $ P.text $ contributionAuthor contribution
