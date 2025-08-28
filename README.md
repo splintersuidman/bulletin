@@ -38,3 +38,13 @@ The rest of the file specifies two contributions.
 Each has an author, title and date.
 The `file` variable specifies the contribution's file.
 Currently, the supported file formats are: Word (`.docx`), OpenDocument text (`.odt`), Markdown (`.md`), and Typst (`.typ`).
+
+## Build instructions
+
+Currently, the only supported build system is Nix.
+You can build or run the program by cloning the Git repository and running `nix build` or `nix run`.
+You can also build or run the program as follows:
+```sh
+nix build github:splintersuidman/bulletin
+nix run github:splintersuidman/bulletin
+```
