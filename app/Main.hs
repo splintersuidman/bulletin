@@ -9,6 +9,7 @@ import           Control.Monad.IO.Class (MonadIO (liftIO))
 import qualified Data.ByteString.Lazy   as BL
 import           Data.List              (intersperse)
 import           Data.Map.Strict        (Map)
+import qualified Data.Map.Strict        as Map
 import           Data.Semigroup         (Min (Min, getMin))
 import           Data.Text              (Text)
 import qualified Data.Text              as Text
@@ -20,6 +21,7 @@ import           System.Exit            (die)
 import           System.FilePath        (takeExtension)
 import           Text.Pandoc
 import qualified Text.Pandoc.Builder    as P
+import           Text.Pandoc.Builder    (Blocks, ToMetaValue (toMetaValue))
 import qualified Text.Pandoc.PDF        as Pandoc
 import qualified Text.Pandoc.Transforms as Pandoc
 import qualified Text.Pandoc.UTF8       as Pandoc
@@ -167,10 +169,16 @@ addContributionHeader contribution = case contributionDocument contribution of
     title = P.toList $ P.text $ contributionTitle contribution
     author = P.toList $ P.emph $ P.text $ contributionAuthor contribution
 
+-- | Extract the blocks from a contribution document, discarding the
+-- meta values.
+extractBlocks :: Contribution Pandoc -> Blocks
+extractBlocks contribution = case contributionDocument contribution of
+  Pandoc _meta blocks -> P.fromList blocks
+
 -- | Perform all necessary transformations to make an input
 -- contribution ready to be used as part of output.
-processContribution :: Contribution Pandoc -> Contribution Pandoc
-processContribution = mapContribution' addContributionHeader . mapContribution correctHeaderLevels
+processContribution :: Contribution Pandoc -> Contribution Blocks
+processContribution = mapContribution' extractBlocks . mapContribution correctHeaderLevels
 
 -- | Read the bulletin configuration from the given file.
 readBulletinConfig :: FilePath -> BulletinIO BulletinConfig
@@ -186,21 +194,29 @@ readContributions :: BulletinConfig -> BulletinIO (Bulletin Pandoc)
 readContributions = mapBulletinM readContribution
 
 -- | Process the contributions.
-processContributions :: Bulletin Pandoc -> Bulletin Pandoc
+processContributions :: Bulletin Pandoc -> Bulletin Blocks
 processContributions = mapBulletin processContribution
+
+instance ToMetaValue a => ToMetaValue (Contribution a) where
+  toMetaValue contribution = toMetaValue @(Map Text MetaValue) $ Map.fromList
+    [ ("title", toMetaValue $ contributionTitle contribution)
+    , ("author", toMetaValue $ contributionAuthor contribution)
+    -- TODO: , ("date", toMetaValue $ contributionDate contribution)
+    , ("body", toMetaValue $ contributionDocument contribution)
+    ]
 
 -- | Compile the bulletin, concatenating the contributions together
 -- into a single document and setting the required variables.
-compileBulletin :: Bulletin Pandoc -> Pandoc
+compileBulletin :: Bulletin Blocks -> Pandoc
 compileBulletin bulletin
   = P.setTitle (P.text $ bulletinTitle bulletin)
   $ P.setDate (P.text $ Text.pack $ Time.showGregorian $ bulletinDate bulletin)
   $ P.setMeta "extra" (bulletinExtra bulletin)
-  $ foldMap contributionDocument
-  $ bulletinContributions bulletin
+  $ P.setMeta "contributions" (toMetaValue $ bulletinContributions bulletin)
+  $ mempty
 
 -- | Read and compile the template file specified in the bulletin.
-readTemplate :: Bulletin Pandoc -> BulletinIO (Template Text)
+readTemplate :: Bulletin a -> BulletinIO (Template Text)
 readTemplate bulletin = do
   templateText <- liftIO $ Text.readFile (bulletinTemplate bulletin)
   templateRes <- liftIO $ compileTemplate (bulletinTemplate bulletin) templateText
@@ -209,7 +225,7 @@ readTemplate bulletin = do
     Right templ -> pure templ
 
 -- | Write the bulletin as a PDF file, compiling it with Typst.
-writeBulletin :: Bulletin Pandoc -> Pandoc -> BulletinIO ()
+writeBulletin :: Bulletin a -> Pandoc -> BulletinIO ()
 writeBulletin bulletin doc = do
   template <- readTemplate bulletin
   compileRes <- liftPandocIO $
