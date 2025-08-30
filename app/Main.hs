@@ -201,7 +201,7 @@ instance ToMetaValue a => ToMetaValue (Contribution a) where
   toMetaValue contribution = toMetaValue @(Map Text MetaValue) $ Map.fromList
     [ ("title", toMetaValue $ contributionTitle contribution)
     , ("author", toMetaValue $ contributionAuthor contribution)
-    -- TODO: , ("date", toMetaValue $ contributionDate contribution)
+    , ("date", toMetaValue $ Time.showGregorian $ contributionDate contribution)
     , ("body", toMetaValue $ contributionDocument contribution)
     ]
 
