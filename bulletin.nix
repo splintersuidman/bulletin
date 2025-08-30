@@ -1,5 +1,5 @@
-{ mkDerivation, base, bytestring, containers, filepath, lens, lib
-, mtl, pandoc, pandoc-types, text, time, tomland
+{ mkDerivation, base, bytestring, containers, directory, filepath
+, lens, lib, mtl, pandoc, pandoc-types, text, time, tomland
 , unordered-containers, wreq
 }:
 mkDerivation {
@@ -9,8 +9,8 @@ mkDerivation {
   isLibrary = false;
   isExecutable = true;
   executableHaskellDepends = [
-    base bytestring containers filepath lens mtl pandoc pandoc-types
-    text time tomland unordered-containers wreq
+    base bytestring containers directory filepath lens mtl pandoc
+    pandoc-types text time tomland unordered-containers wreq
   ];
   license = lib.licenses.gpl3Plus;
   mainProgram = "bulletin";

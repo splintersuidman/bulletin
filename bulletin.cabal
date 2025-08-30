@@ -71,6 +71,7 @@ executable bulletin
     build-depends:    base
                     , bytestring
                     , containers
+                    , directory
                     , filepath
                     , lens
                     , mtl

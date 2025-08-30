@@ -21,9 +21,10 @@ import qualified Data.Text.Lazy          as TL
 import qualified Data.Text.Lazy.Encoding as TL
 import qualified Data.Time               as Time
 import qualified Network.Wreq            as Wreq
+import           System.Directory        (setCurrentDirectory)
 import           System.Environment      (getArgs)
 import           System.Exit             (die)
-import           System.FilePath         (takeExtension)
+import           System.FilePath         (takeDirectory, takeExtension)
 import           Text.Pandoc
 import qualified Text.Pandoc.Builder     as P
 import           Text.Pandoc.Builder     (Blocks, ToMetaValue (toMetaValue))
@@ -291,6 +292,8 @@ main = runBulletinIO $ do
 
   for_ args $ \configFile -> do
     bulletinConfig <- readBulletinConfig configFile
+    -- Set directory to that of config file, to deal with paths relative to it.
+    liftIO $ setCurrentDirectory $ takeDirectory configFile
     bulletin <- processContributions <$> readContributions bulletinConfig
     template <- readTemplate bulletin
     writeBulletin bulletin template $ compileBulletin bulletin
