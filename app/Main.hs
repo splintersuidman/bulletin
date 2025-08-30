@@ -7,7 +7,8 @@ import           Control.Monad.Except   (ExceptT, MonadError (throwError),
                                          runExceptT)
 import           Control.Monad.IO.Class (MonadIO (liftIO))
 import qualified Data.ByteString.Lazy   as BL
-import           Data.List              (intersperse)
+import           Data.Foldable          (for_)
+import           Data.List              (intercalate)
 import           Data.Map.Strict        (Map)
 import qualified Data.Map.Strict        as Map
 import           Data.Semigroup         (Min (Min, getMin))
@@ -15,7 +16,6 @@ import           Data.Text              (Text)
 import qualified Data.Text              as Text
 import qualified Data.Text.IO           as Text
 import qualified Data.Time              as Time
-import           Data.Traversable       (for)
 import           System.Environment     (getArgs)
 import           System.Exit            (die)
 import           System.FilePath        (takeExtension)
@@ -63,13 +63,9 @@ data Contribution doc = Contribution
   , contributionTitle    :: !Text
   , contributionDate     :: !Time.Day
   , contributionDocument :: doc
-  } deriving (Show)
+  } deriving (Show, Functor)
 
 type ContributionConfig = Contribution FilePath
-
-mapContribution :: (a -> b) -> Contribution a -> Contribution b
-mapContribution f contribution = contribution
-  { contributionDocument = f (contributionDocument contribution) }
 
 mapContribution' :: (Contribution a -> b) -> Contribution a -> Contribution b
 mapContribution' f contribution = contribution
@@ -78,7 +74,7 @@ mapContribution' f contribution = contribution
 mapContributionM :: Monad m => (a -> m b) -> Contribution a -> m (Contribution b)
 mapContributionM f contribution = do
   doc <- f (contributionDocument contribution)
-  pure $ mapContribution (const doc) contribution
+  pure $ fmap (const doc) contribution
 
 contributionCodec :: TomlCodec ContributionConfig
 contributionCodec = Contribution
@@ -99,7 +95,7 @@ instance Show BulletinError where
   show = \case
     BulletinUnsupportedFormat fmt -> "Unsupported file format for contribution: " <> fmt
     BulletinPandocError err -> "Pandoc error: " <> show err
-    BulletinTomlDecodeError errs -> "Toml error(s): " <> (concat $ intersperse "\n" $ fmap show errs)
+    BulletinTomlDecodeError errs -> "Toml error(s): " <> intercalate "\n" (fmap show errs)
     BulletinCompileError err -> "Compile error: " <> Pandoc.toStringLazy err
     BulletinTemplateError err -> "Template error: " <> err
     BulletinUsageError err -> "Usage error: " <> err
@@ -110,16 +106,15 @@ newtype BulletinIO a = BulletinIO { unBulletinIO :: ExceptT BulletinError IO a }
 runBulletinIO :: BulletinIO a -> IO a
 runBulletinIO mx = do
   res <- runExceptT $ unBulletinIO mx
-  case res of
-    Left err -> die $ show err
-    Right x  -> pure x
+  either (die . show) pure res
+
+liftEither' :: MonadError e m => (e' -> e) -> Either e' a -> m a
+liftEither' f = either (throwError . f) pure
 
 liftPandocIO :: PandocIO a -> BulletinIO a
 liftPandocIO mx = do
   res <- liftIO $ runIO mx
-  case res of
-    Left err -> throwError $ BulletinPandocError err
-    Right x  -> pure x
+  liftEither' BulletinPandocError res
 
 -- | Read a contribution and parse it into Pandoc's AST.
 readContribution :: Contribution FilePath -> BulletinIO (Contribution Pandoc)
@@ -178,15 +173,13 @@ extractBlocks contribution = case contributionDocument contribution of
 -- | Perform all necessary transformations to make an input
 -- contribution ready to be used as part of output.
 processContribution :: Contribution Pandoc -> Contribution Blocks
-processContribution = mapContribution' extractBlocks . mapContribution correctHeaderLevels
+processContribution = mapContribution' extractBlocks . fmap correctHeaderLevels
 
 -- | Read the bulletin configuration from the given file.
 readBulletinConfig :: FilePath -> BulletinIO BulletinConfig
 readBulletinConfig filename = do
   res <- Toml.decodeFileEither bulletinCodec filename
-  case res of
-    Left errs      -> throwError $ BulletinTomlDecodeError errs
-    Right bulletin -> pure bulletin
+  liftEither' BulletinTomlDecodeError res
 
 -- | Read the contributions specified in the given bulletin
 -- configuration.
@@ -216,18 +209,15 @@ compileBulletin bulletin
   $ mempty
 
 -- | Read and compile the template file specified in the bulletin.
-readTemplate :: Bulletin a -> BulletinIO (Template Text)
+readTemplate :: Bulletin doc -> BulletinIO (Template Text)
 readTemplate bulletin = do
   templateText <- liftIO $ Text.readFile (bulletinTemplate bulletin)
   templateRes <- liftIO $ compileTemplate (bulletinTemplate bulletin) templateText
-  case templateRes of
-    Left err    -> throwError $ BulletinTemplateError err
-    Right templ -> pure templ
+  liftEither' BulletinTemplateError templateRes
 
 -- | Write the bulletin as a PDF file, compiling it with Typst.
-writeBulletin :: Bulletin a -> Pandoc -> BulletinIO ()
-writeBulletin bulletin doc = do
-  template <- readTemplate bulletin
+writeBulletin :: Bulletin doc -> Template Text -> Pandoc -> BulletinIO ()
+writeBulletin bulletin template doc = do
   compileRes <- liftPandocIO $
     Pandoc.makePDF
       "typst"
@@ -235,16 +225,17 @@ writeBulletin bulletin doc = do
       writeTypst
       def { writerTemplate = Just template }
       doc
-  case compileRes of
-    Left err  -> throwError $ BulletinCompileError err
-    Right out -> liftIO $ BL.writeFile (bulletinFilename bulletin) out
+  out <- liftEither' BulletinCompileError compileRes
+  liftIO $ BL.writeFile (bulletinFilename bulletin) out
 
 main :: IO ()
 main = runBulletinIO $ do
   args <- liftIO getArgs
-  when (args == []) $ throwError $ BulletinUsageError "Specify configuration file(s): bulletin <file ...>"
-  _ <- for args $ \configFile -> do
+  when (null args) $
+    throwError $ BulletinUsageError "Specify configuration file(s): bulletin <file ...>"
+
+  for_ args $ \configFile -> do
     bulletinConfig <- readBulletinConfig configFile
     bulletin <- processContributions <$> readContributions bulletinConfig
-    writeBulletin bulletin $ compileBulletin bulletin
-  pure ()
+    template <- readTemplate bulletin
+    writeBulletin bulletin template $ compileBulletin bulletin
