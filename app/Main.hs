@@ -28,7 +28,10 @@ import           System.FilePath         (takeDirectory, takeExtension)
 import           Text.Pandoc
 import qualified Text.Pandoc.Builder     as P
 import           Text.Pandoc.Builder     (Blocks, ToMetaValue (toMetaValue))
+import qualified Text.Pandoc.Extensions  as Pandoc
+import qualified Text.Pandoc.Format      as Pandoc
 import qualified Text.Pandoc.PDF         as Pandoc
+import qualified Text.Pandoc.Readers     as Pandoc
 import qualified Text.Pandoc.Transforms  as Pandoc
 import qualified Text.Pandoc.UTF8        as Pandoc
 import           Text.Pandoc.Walk        (query)
@@ -119,7 +122,7 @@ sourceCodec
   <|> Toml.dimatch matchSourceGoogleDocs SourceGoogleDocs (Toml.text "google-docs")
 
 data BulletinError
-  = BulletinUnsupportedFormat String
+  = BulletinUnsupportedFormat Source
   | BulletinPandocError PandocError
   | BulletinTomlDecodeError [TomlDecodeError]
   | BulletinCompileError BL.ByteString
@@ -128,7 +131,7 @@ data BulletinError
 
 instance Show BulletinError where
   show = \case
-    BulletinUnsupportedFormat fmt -> "Unsupported file format for contribution: " <> fmt
+    BulletinUnsupportedFormat fmt -> "Unsupported file format for contribution: " <> show fmt
     BulletinPandocError err -> "Pandoc error: " <> show err
     BulletinTomlDecodeError errs -> "Toml error(s): " <> intercalate "\n" (fmap show errs)
     BulletinCompileError err -> "Compile error: " <> Pandoc.toStringLazy err
@@ -146,6 +149,9 @@ runBulletinIO mx = do
 liftEither' :: MonadError e m => (e' -> e) -> Either e' a -> m a
 liftEither' f = either (throwError . f) pure
 
+liftMaybe :: MonadError e m => e -> Maybe a -> m a
+liftMaybe err = maybe (throwError err) pure
+
 liftPandocIO :: PandocIO a -> BulletinIO a
 liftPandocIO mx = do
   res <- liftIO $ runIO mx
@@ -154,8 +160,14 @@ liftPandocIO mx = do
 sourceExtension :: Source -> String
 sourceExtension = \case
   SourceFile filename -> takeExtension filename
-  SourceUrl url -> takeExtension $ Text.unpack $ url
+  SourceUrl url -> takeExtension $ Text.unpack url
   SourceGoogleDocs _ -> ".docx"
+
+formatFromSource :: Source -> Maybe Pandoc.FlavoredFormat
+formatFromSource = \case
+  SourceFile filename -> Pandoc.formatFromFilePaths [filename]
+  SourceUrl url -> Pandoc.formatFromFilePaths [Text.unpack url]
+  SourceGoogleDocs _ -> Just $ Pandoc.FlavoredFormat { formatName = "docx", formatExtsDiff = mempty }
 
 readUrl :: Text -> BulletinIO BL.ByteString
 readUrl url = liftIO $ (^. Wreq.responseBody) <$> Wreq.get (Text.unpack url)
@@ -172,35 +184,22 @@ readSourceLazy = \case
 readSource :: Source -> BulletinIO Text
 readSource = fmap (TL.toStrict . TL.decodeUtf8) . readSourceLazy
 
-readPandocLazy :: Contribution Source
-               -> (forall m. PandocMonad m => ReaderOptions -> BL.ByteString -> m Pandoc)
-               -> BulletinIO (Contribution Pandoc)
-readPandocLazy contribution reader = do
+readPandoc :: Pandoc.Reader PandocIO -> Pandoc.Extensions -> Contribution Source -> BulletinIO (Contribution Pandoc)
+readPandoc reader extensions contribution = do
   let source = contributionDocument contribution
-  content <- readSourceLazy source
-  doc <- liftPandocIO $ reader def content
-  pure $ doc <$ contribution
-
-readPandoc :: Contribution Source
-           -> (forall m. PandocMonad m => ReaderOptions -> Text -> m Pandoc)
-           -> BulletinIO (Contribution Pandoc)
-readPandoc contribution reader = do
-  let source = contributionDocument contribution
-  content <- readSource source
-  doc <- liftPandocIO $ reader def content
+  let readerOptions = def { readerExtensions = extensions }
+  doc <- case reader of
+    Pandoc.ByteStringReader r -> liftPandocIO . r readerOptions =<< readSourceLazy source
+    Pandoc.TextReader r -> liftPandocIO . r readerOptions =<< readSource source
   pure $ doc <$ contribution
 
 -- | Read a contribution and parse it into Pandoc's AST.
 readContribution :: Contribution Source -> BulletinIO (Contribution Pandoc)
 readContribution contribution = do
-  let extension = sourceExtension $ contributionDocument contribution
-  case extension  of
-    ".docx" -> readPandocLazy contribution readDocx
-    ".md"   -> readPandoc contribution readMarkdown
-    ".odt"  -> readPandocLazy contribution readODT
-    ".rtf"  -> readPandoc contribution readRTF
-    ".typ"  -> readPandoc contribution readTypst
-    _       -> throwError $ BulletinUnsupportedFormat extension
+  let source = contributionDocument contribution
+  format <- liftMaybe (BulletinUnsupportedFormat source) $ formatFromSource source
+  (reader, extensions) <- liftPandocIO $ Pandoc.getReader format
+  readPandoc reader extensions contribution
 
 -- | Obtain the minimal header level from the document, if any headers
 -- are present.
