@@ -25,7 +25,7 @@ import qualified Network.Wreq            as Wreq
 import           System.Directory        (setCurrentDirectory)
 import           System.Environment      (getArgs)
 import           System.Exit             (die)
-import           System.FilePath         (takeDirectory)
+import           System.FilePath         (takeBaseName, takeDirectory)
 import           Text.Pandoc
 import qualified Text.Pandoc.Builder     as P
 import           Text.Pandoc.Builder     (Blocks, ToMetaValue (toMetaValue))
@@ -36,30 +36,34 @@ import qualified Text.Pandoc.Readers     as Pandoc
 import qualified Text.Pandoc.Transforms  as Pandoc
 import qualified Text.Pandoc.UTF8        as Pandoc
 import           Text.Pandoc.Walk        (query)
+import qualified Text.Pandoc.Writers     as Pandoc
 import qualified Toml
 import           Toml                    (TomlCodec, TomlDecodeError, (.=))
 
 data Bulletin templ doc = Bulletin
   { bulletinTitle         :: !Text
   , bulletinDate          :: !Time.Day
-  , bulletinFilename      :: !FilePath
-  , bulletinTemplate      :: !templ
   , bulletinExtra         :: !(Map Text Text)
+  , bulletinOutputs       :: ![Output templ]
   , bulletinContributions :: [Contribution doc]
   } deriving (Show)
 
-mapBulletin :: (t -> t') -> (Contribution d -> Contribution d') -> Bulletin t d -> Bulletin t' d'
+mapBulletin :: (Output t -> Output t') -> (Contribution d -> Contribution d') -> Bulletin t d -> Bulletin t' d'
 mapBulletin f g bulletin = bulletin
-  { bulletinTemplate = f (bulletinTemplate bulletin)
+  { bulletinOutputs = fmap f (bulletinOutputs bulletin)
   , bulletinContributions = fmap g (bulletinContributions bulletin)
   }
 
-mapBulletinM :: Monad m => (t -> m t') -> (Contribution d -> m (Contribution d')) -> Bulletin t d -> m (Bulletin t' d')
+mapBulletinM :: Monad m
+             => (Output t -> m (Output t'))
+             -> (Contribution d -> m (Contribution d'))
+             -> Bulletin t d
+             -> m (Bulletin t' d')
 mapBulletinM f g bulletin = do
-  template <- f $ bulletinTemplate bulletin
+  outputs <- mapM f $ bulletinOutputs bulletin
   contributions <- mapM g $ bulletinContributions bulletin
   pure $ bulletin
-    { bulletinTemplate = template
+    { bulletinOutputs = outputs
     , bulletinContributions = contributions
     }
 
@@ -67,10 +71,56 @@ bulletinCodec :: TomlCodec (Bulletin FilePath Input)
 bulletinCodec = Bulletin
   <$> Toml.text                             "title"        .= bulletinTitle
   <*> Toml.day                              "date"         .= bulletinDate
-  <*> Toml.string                           "file"         .= bulletinFilename
-  <*> Toml.string                           "template"     .= bulletinTemplate
   <*> Toml.tableMap Toml._KeyText Toml.text "extra"        .= bulletinExtra
+  <*> Toml.list outputCodec                 "output"       .= bulletinOutputs
   <*> Toml.list contributionCodec           "contribution" .= bulletinContributions
+
+data Output templ = Output
+  { outputFilename :: !FilePath
+  , outputFormat   :: !OutputFormat
+  , outputTemplate :: templ
+  } deriving (Show, Functor)
+
+outputCodec :: TomlCodec (Output FilePath)
+outputCodec = Output
+  <$> Toml.string "file"     .= outputFilename
+  <*> outputFormatCodec      .= outputFormat
+  <*> Toml.string "template" .= outputTemplate
+
+data OutputFormat
+  = OutputFormat Text
+    -- ^ Output format for all formats except PDF (supported by writers in 'Pandoc.writers')
+  | OutputFormatPdf Text
+    -- ^ PDF output with specified compiler (supported by 'Pandoc.makePDF')
+  | OutputFormatUnspecified
+  deriving (Show)
+
+matchOutputFormat :: OutputFormat -> Maybe Text
+matchOutputFormat = \case
+  OutputFormat format -> Just format
+  _ -> Nothing
+
+matchOutputFormatPdf :: OutputFormat -> Maybe Text
+matchOutputFormatPdf = \case
+  OutputFormatPdf compiler -> Just compiler
+  _ -> Nothing
+
+matchOutputFormatUnspecified :: OutputFormat -> Maybe ()
+matchOutputFormatUnspecified = \case
+  OutputFormatUnspecified -> Just ()
+  _ -> Nothing
+
+outputFormatCodec :: TomlCodec OutputFormat
+outputFormatCodec
+   =  Toml.dimatch matchOutputFormatPdf OutputFormatPdf pdf
+  <|> Toml.dimatch matchOutputFormat OutputFormat otherFormat
+  <|> pure OutputFormatUnspecified
+  where
+    pdf = Toml.hardcoded "pdf" Toml._Text "format" *> Toml.text "compiler"
+    validateOtherFormat format = if format == "pdf"
+      then Left "PDF output format should be accompanied by compiler option"
+      else Right format
+    otherFormat = Toml.validate validateOtherFormat Toml._Text "format"
 
 data Contribution doc = Contribution
   { contributionAuthor   :: !Text
@@ -82,11 +132,6 @@ data Contribution doc = Contribution
 mapContribution' :: (Contribution a -> b) -> Contribution a -> Contribution b
 mapContribution' f contribution = contribution
   { contributionDocument = f contribution }
-
-mapContributionM :: Monad m => (a -> m b) -> Contribution a -> m (Contribution b)
-mapContributionM f contribution = do
-  doc <- f (contributionDocument contribution)
-  pure $ fmap (const doc) contribution
 
 contributionCodec :: TomlCodec (Contribution Input)
 contributionCodec = Contribution
@@ -133,21 +178,25 @@ sourceCodec
   <|> Toml.dimatch matchSourceGoogleDocs SourceGoogleDocs (Toml.text "google-docs")
 
 data BulletinError
-  = BulletinUnsupportedFormat Input
+  = BulletinUnsupportedInputFormat Input
+  | BulletinUnsupportedOutputFormat String
   | BulletinPandocError PandocError
   | BulletinTomlDecodeError [TomlDecodeError]
   | BulletinCompileError BL.ByteString
   | BulletinTemplateError String
   | BulletinUsageError String
+  | BulletinUnsupportedPdfCompiler Text
 
 instance Show BulletinError where
   show = \case
-    BulletinUnsupportedFormat fmt -> "Unsupported file format for contribution: " <> show fmt
+    BulletinUnsupportedInputFormat fmt -> "Unsupported file format for contribution: " <> show fmt
+    BulletinUnsupportedOutputFormat fmt -> "Unsupported file format for output: " <> show fmt
     BulletinPandocError err -> "Pandoc error: " <> show err
     BulletinTomlDecodeError errs -> "Toml error(s): " <> intercalate "\n" (fmap show errs)
     BulletinCompileError err -> "Compile error: " <> Pandoc.toStringLazy err
     BulletinTemplateError err -> "Template error: " <> err
     BulletinUsageError err -> "Usage error: " <> err
+    BulletinUnsupportedPdfCompiler compiler -> "Unsupported PDF compiler: " <> Text.unpack compiler
 
 newtype BulletinIO a = BulletinIO { unBulletinIO :: ExceptT BulletinError IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadError BulletinError)
@@ -182,7 +231,7 @@ formatFromSource = \case
 
 formatFromInput :: Input -> BulletinIO Pandoc.FlavoredFormat
 formatFromInput input = case inputFormat input of
-  Nothing     -> liftMaybe (BulletinUnsupportedFormat input) $ formatFromSource $ inputSource input
+  Nothing     -> liftMaybe (BulletinUnsupportedInputFormat input) $ formatFromSource $ inputSource input
   Just format -> liftPandocIO $ Pandoc.parseFlavoredFormat format
 
 readUrl :: Text -> BulletinIO BL.ByteString
@@ -261,11 +310,11 @@ readBulletinConfig filename = do
 
 -- | Read the contributions specified in the given bulletin
 -- configuration.
-readContributions :: Bulletin FilePath Input -> BulletinIO (Bulletin FilePath Pandoc)
+readContributions :: Bulletin templ Input -> BulletinIO (Bulletin templ Pandoc)
 readContributions = mapBulletinM pure readContribution
 
 -- | Process the contributions.
-processContributions :: Bulletin FilePath Pandoc -> Bulletin FilePath Blocks
+processContributions :: Bulletin templ Pandoc -> Bulletin templ Blocks
 processContributions = mapBulletin id processContribution
 
 instance ToMetaValue a => ToMetaValue (Contribution a) where
@@ -286,26 +335,74 @@ compileBulletin bulletin
   $ P.setMeta "contributions" (toMetaValue $ bulletinContributions bulletin)
   $ mempty
 
--- | Read and compile the template file specified in the bulletin.
-readTemplate :: Bulletin FilePath doc -> BulletinIO (Bulletin (Template Text) doc)
-readTemplate bulletin = do
-  templateText <- liftIO $ Text.readFile (bulletinTemplate bulletin)
-  templateRes <- liftIO $ compileTemplate (bulletinTemplate bulletin) templateText
+-- | Read and compile the template file specified in the output.
+readTemplate :: Output FilePath -> BulletinIO (Output (Template Text))
+readTemplate output = do
+  let templateFile = outputTemplate output
+  templateText <- liftIO $ Text.readFile templateFile
+  templateRes <- liftIO $ compileTemplate templateFile templateText
   template <- liftEither' BulletinTemplateError templateRes
-  pure $ mapBulletin (const template) id bulletin
+  pure $ template <$ output
+
+-- | Read and compile the template files specified in the outputs of
+-- the bulletin.
+readTemplates :: Bulletin FilePath doc -> BulletinIO (Bulletin (Template Text) doc)
+readTemplates = mapBulletinM readTemplate pure
+
+formatFromOutput :: FilePath -> Maybe Text -> BulletinIO Pandoc.FlavoredFormat
+formatFromOutput filename = \case
+  Nothing -> liftMaybe (BulletinUnsupportedOutputFormat $ filename) $
+    Pandoc.formatFromFilePaths [filename]
+  Just format -> liftPandocIO $ Pandoc.parseFlavoredFormat format
+
+writeOutputNormal :: Pandoc -> Output (Template Text) -> Maybe Text -> BulletinIO ()
+writeOutputNormal doc output fmt = do
+  format <- formatFromOutput (outputFilename output) fmt
+  (writer, extensions) <- liftPandocIO $ Pandoc.getWriter format
+  let writerOptions = def
+        { writerExtensions = extensions
+        , writerTemplate = Just (outputTemplate output)
+        }
+  case writer of
+    Pandoc.ByteStringWriter w -> liftIO . BL.writeFile (outputFilename output) =<< liftPandocIO (w writerOptions doc)
+    Pandoc.TextWriter w       -> liftIO . Text.writeFile (outputFilename output) =<< liftPandocIO (w writerOptions doc)
+
+compilerToWriter :: Text -> BulletinIO (WriterOptions -> Pandoc -> PandocIO Text)
+compilerToWriter compiler = case takeBaseName (Text.unpack compiler) of
+  "wkhtmltopdf"  -> pure writeHtml5String
+  "pagedjs-cli"  -> pure writeHtml5String
+  "prince"       -> pure writeHtml5String
+  "weasyprint"   -> pure writeHtml5String
+  "typst"        -> pure writeTypst
+  "pdfroff"      -> pure writeMs
+  "groff"        -> pure writeMs
+  "context"      -> pure writeLaTeX
+  "tectonic"     -> pure writeLaTeX
+  "latexmk"      -> pure writeLaTeX
+  "lualatex"     -> pure writeLaTeX
+  "lualatex-dev" -> pure writeLaTeX
+  "pdflatex"     -> pure writeLaTeX
+  "pdflatex-dev" -> pure writeLaTeX
+  "xelatex"      -> pure writeLaTeX
+  _              -> throwError $ BulletinUnsupportedPdfCompiler compiler
+
+writeOutputPdf :: Pandoc -> Output (Template Text) -> Text -> BulletinIO ()
+writeOutputPdf doc output compiler = do
+  writer <- compilerToWriter compiler
+  let writerOptions = def { writerTemplate = Just (outputTemplate output) }
+  compileRes <- liftPandocIO $ Pandoc.makePDF (Text.unpack compiler) [] writer writerOptions doc
+  out <- liftEither' BulletinCompileError compileRes
+  liftIO $ BL.writeFile (outputFilename output) out
 
 -- | Write the bulletin as a PDF file, compiling it with Typst.
-writeBulletin :: Bulletin (Template Text) doc -> Pandoc -> BulletinIO ()
-writeBulletin bulletin doc = do
-  compileRes <- liftPandocIO $
-    Pandoc.makePDF
-      "typst"
-      []
-      writeTypst
-      def { writerTemplate = Just (bulletinTemplate bulletin) }
-      doc
-  out <- liftEither' BulletinCompileError compileRes
-  liftIO $ BL.writeFile (bulletinFilename bulletin) out
+writeOutput :: Pandoc -> Output (Template Text) -> BulletinIO ()
+writeOutput doc output = case outputFormat output of
+  OutputFormatUnspecified  -> writeOutputNormal doc output Nothing
+  OutputFormat format      -> writeOutputNormal doc output (Just format)
+  OutputFormatPdf compiler -> writeOutputPdf doc output compiler
+
+writeOutputs :: Bulletin (Template Text) doc -> Pandoc -> BulletinIO ()
+writeOutputs bulletin doc = for_ (bulletinOutputs bulletin) $ writeOutput doc
 
 main :: IO ()
 main = runBulletinIO $ do
@@ -317,5 +414,5 @@ main = runBulletinIO $ do
     bulletinConfig <- readBulletinConfig configFile
     -- Set directory to that of config file, to deal with paths relative to it.
     liftIO $ setCurrentDirectory $ takeDirectory configFile
-    bulletin <- readTemplate . processContributions =<< readContributions bulletinConfig
-    writeBulletin bulletin $ compileBulletin bulletin
+    bulletin <- readTemplates . processContributions =<< readContributions bulletinConfig
+    writeOutputs bulletin $ compileBulletin bulletin
