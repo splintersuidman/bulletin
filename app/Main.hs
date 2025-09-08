@@ -35,25 +35,31 @@ import           Text.Pandoc.Walk        (query)
 import qualified Toml
 import           Toml                    (TomlCodec, TomlDecodeError, (.=))
 
-data Bulletin doc = Bulletin
+data Bulletin templ doc = Bulletin
   { bulletinTitle         :: !Text
   , bulletinDate          :: !Time.Day
   , bulletinFilename      :: !FilePath
-  , bulletinTemplate      :: !FilePath
+  , bulletinTemplate      :: !templ
   , bulletinExtra         :: !(Map Text Text)
   , bulletinContributions :: [Contribution doc]
   } deriving (Show)
 
-mapBulletin :: (Contribution a -> Contribution b) -> Bulletin a -> Bulletin b
-mapBulletin f bulletin = bulletin
-  { bulletinContributions = fmap f (bulletinContributions bulletin) }
+mapBulletin :: (t -> t') -> (Contribution d -> Contribution d') -> Bulletin t d -> Bulletin t' d'
+mapBulletin f g bulletin = bulletin
+  { bulletinTemplate = f (bulletinTemplate bulletin)
+  , bulletinContributions = fmap g (bulletinContributions bulletin)
+  }
 
-mapBulletinM :: Monad m => (Contribution a -> m (Contribution b)) -> Bulletin a -> m (Bulletin b)
-mapBulletinM f bulletin = do
-  contributions <- mapM f $ bulletinContributions bulletin
-  pure $ bulletin { bulletinContributions = contributions }
+mapBulletinM :: Monad m => (t -> m t') -> (Contribution d -> m (Contribution d')) -> Bulletin t d -> m (Bulletin t' d')
+mapBulletinM f g bulletin = do
+  template <- f $ bulletinTemplate bulletin
+  contributions <- mapM g $ bulletinContributions bulletin
+  pure $ bulletin
+    { bulletinTemplate = template
+    , bulletinContributions = contributions
+    }
 
-bulletinCodec :: TomlCodec (Bulletin Source)
+bulletinCodec :: TomlCodec (Bulletin FilePath Source)
 bulletinCodec = Bulletin
   <$> Toml.text                             "title"        .= bulletinTitle
   <*> Toml.day                              "date"         .= bulletinDate
@@ -232,19 +238,19 @@ processContribution :: Contribution Pandoc -> Contribution Blocks
 processContribution = mapContribution' extractBlocks . fmap correctHeaderLevels
 
 -- | Read the bulletin configuration from the given file.
-readBulletinConfig :: FilePath -> BulletinIO (Bulletin Source)
+readBulletinConfig :: FilePath -> BulletinIO (Bulletin FilePath Source)
 readBulletinConfig filename = do
   res <- Toml.decodeFileEither bulletinCodec filename
   liftEither' BulletinTomlDecodeError res
 
 -- | Read the contributions specified in the given bulletin
 -- configuration.
-readContributions :: Bulletin Source -> BulletinIO (Bulletin Pandoc)
-readContributions = mapBulletinM readContribution
+readContributions :: Bulletin FilePath Source -> BulletinIO (Bulletin FilePath Pandoc)
+readContributions = mapBulletinM pure readContribution
 
 -- | Process the contributions.
-processContributions :: Bulletin Pandoc -> Bulletin Blocks
-processContributions = mapBulletin processContribution
+processContributions :: Bulletin FilePath Pandoc -> Bulletin FilePath Blocks
+processContributions = mapBulletin id processContribution
 
 instance ToMetaValue a => ToMetaValue (Contribution a) where
   toMetaValue contribution = toMetaValue @(Map Text MetaValue) $ Map.fromList
@@ -256,7 +262,7 @@ instance ToMetaValue a => ToMetaValue (Contribution a) where
 
 -- | Compile the bulletin, concatenating the contributions together
 -- into a single document and setting the required variables.
-compileBulletin :: Bulletin Blocks -> Pandoc
+compileBulletin :: Bulletin templ Blocks -> Pandoc
 compileBulletin bulletin
   = P.setTitle (P.text $ bulletinTitle bulletin)
   $ P.setDate (P.text $ Text.pack $ Time.showGregorian $ bulletinDate bulletin)
@@ -265,21 +271,22 @@ compileBulletin bulletin
   $ mempty
 
 -- | Read and compile the template file specified in the bulletin.
-readTemplate :: Bulletin doc -> BulletinIO (Template Text)
+readTemplate :: Bulletin FilePath doc -> BulletinIO (Bulletin (Template Text) doc)
 readTemplate bulletin = do
   templateText <- liftIO $ Text.readFile (bulletinTemplate bulletin)
   templateRes <- liftIO $ compileTemplate (bulletinTemplate bulletin) templateText
-  liftEither' BulletinTemplateError templateRes
+  template <- liftEither' BulletinTemplateError templateRes
+  pure $ mapBulletin (const template) id bulletin
 
 -- | Write the bulletin as a PDF file, compiling it with Typst.
-writeBulletin :: Bulletin doc -> Template Text -> Pandoc -> BulletinIO ()
-writeBulletin bulletin template doc = do
+writeBulletin :: Bulletin (Template Text) doc -> Pandoc -> BulletinIO ()
+writeBulletin bulletin doc = do
   compileRes <- liftPandocIO $
     Pandoc.makePDF
       "typst"
       []
       writeTypst
-      def { writerTemplate = Just template }
+      def { writerTemplate = Just (bulletinTemplate bulletin) }
       doc
   out <- liftEither' BulletinCompileError compileRes
   liftIO $ BL.writeFile (bulletinFilename bulletin) out
@@ -294,6 +301,5 @@ main = runBulletinIO $ do
     bulletinConfig <- readBulletinConfig configFile
     -- Set directory to that of config file, to deal with paths relative to it.
     liftIO $ setCurrentDirectory $ takeDirectory configFile
-    bulletin <- processContributions <$> readContributions bulletinConfig
-    template <- readTemplate bulletin
-    writeBulletin bulletin template $ compileBulletin bulletin
+    bulletin <- readTemplate . processContributions =<< readContributions bulletinConfig
+    writeBulletin bulletin $ compileBulletin bulletin
