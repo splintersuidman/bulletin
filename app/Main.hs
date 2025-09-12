@@ -362,6 +362,7 @@ writeOutputNormal doc output fmt = do
   let writerOptions = def
         { writerExtensions = extensions
         , writerTemplate = Just (outputTemplate output)
+        , writerColumns = maxBound
         }
   case writer of
     Pandoc.ByteStringWriter w -> liftIO . BL.writeFile (outputFilename output) =<< liftPandocIO (w writerOptions doc)
@@ -389,7 +390,10 @@ compilerToWriter compiler = case takeBaseName (Text.unpack compiler) of
 writeOutputPdf :: Pandoc -> Output (Template Text) -> Text -> BulletinIO ()
 writeOutputPdf doc output compiler = do
   writer <- compilerToWriter compiler
-  let writerOptions = def { writerTemplate = Just (outputTemplate output) }
+  let writerOptions = def
+        { writerTemplate = Just (outputTemplate output)
+        , writerColumns = maxBound
+        }
   compileRes <- liftPandocIO $ Pandoc.makePDF (Text.unpack compiler) [] writer writerOptions doc
   out <- liftEither' BulletinCompileError compileRes
   liftIO $ BL.writeFile (outputFilename output) out
